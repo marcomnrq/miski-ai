@@ -1,18 +1,25 @@
+mod ai;
+mod audio;
 mod models;
+mod pipeline;
 mod storage;
+mod transcription;
 
 use models::*;
 use storage::JsonStore;
 use std::sync::{Arc, Mutex};
-use tauri::{State, Emitter};
+use tauri::{Emitter, State};
 use cpal::traits::HostTrait;
+
+use audio::AudioRecorderHandle;
+use ai::OllamaClient;
 
 // ── Managed State ──────────────────────────────────────────────
 
 /// Holds the audio recorder when a recording is active.
 pub struct AppState {
     /// Active audio recorder (Some while recording, None otherwise)
-    pub recorder: Mutex<Option<Box<dyn RecorderTrait + Send>>>,
+    pub recorder: Mutex<Option<AudioRecorderHandle>>,
     /// Store is shared so async tasks can access it
     pub store: Arc<JsonStore>,
     /// Recording metadata while recording is active
@@ -23,17 +30,8 @@ pub struct AppState {
 struct RecordingMeta {
     pub id: String,
     pub session_name: String,
+    pub notes: String,
     pub started_at: String,
-}
-
-/// Trait for audio recorder (allows mocking in tests)
-trait RecorderTrait {
-    fn start(&mut self) -> Result<(), String>;
-    fn stop(&mut self, output_path: &std::path::Path) -> Result<f64, String>;
-    fn pause(&self) -> Result<(), String>;
-    fn resume(&self) -> Result<(), String>;
-    fn get_audio_level(&self) -> f32;
-    fn get_duration(&self) -> f64;
 }
 
 // ── Recording Commands ─────────────────────────────────────────
@@ -48,8 +46,9 @@ async fn start_recording(
         return Err("Already recording".into());
     }
 
-    // For now, use a simple placeholder until cpal is integrated
-    // This will be replaced with AudioRecorder::new() in Step 2
+    // Create and start the real audio recorder (spawns dedicated audio thread)
+    let recorder = AudioRecorderHandle::start()?;
+
     let id = uuid::Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
     let wav_path = state.store.recordings_dir().join(format!("{}.wav", id));
@@ -59,11 +58,11 @@ async fn start_recording(
     *meta = Some(RecordingMeta {
         id: id.clone(),
         session_name: name.clone(),
+        notes: String::new(),
         started_at: started_at.clone(),
     });
 
-    // TODO: Create real AudioRecorder and store in recorder_guard
-    // *recorder_guard = Some(Box::new(AudioRecorder::new()?));
+    *recorder_guard = Some(recorder);
 
     Ok(RecordingInfo {
         id,
@@ -74,23 +73,60 @@ async fn start_recording(
 }
 
 #[tauri::command]
-async fn stop_recording(state: State<'_, AppState>) -> Result<String, String> {
-    let mut recorder_guard = state.recorder.lock().map_err(|e| e.to_string())?;
-
-    if recorder_guard.is_none() {
-        return Err("Not recording".into());
-    }
-
+async fn stop_recording(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    // Take the recorder out (stops recording and saves WAV)
     // Take the recorder out
-    *recorder_guard = None;
+    let recorder_guard = state.recorder.lock().map_err(|e| e.to_string())?;
+    let recorder = recorder_guard
+        .as_ref()
+        .ok_or("Not recording")?;
 
-    let mut meta = state.recording_meta.lock().map_err(|e| e.to_string())?;
-    let meta_val = meta.take().ok_or("No recording metadata")?;
+    // Take metadata
+    let mut meta_guard = state.recording_meta.lock().map_err(|e| e.to_string())?;
+    let meta = meta_guard
+        .take()
+        .ok_or("No recording metadata")?;
 
-    let wav_path = state.store.recordings_dir().join(format!("{}.wav", meta_val.id));
+    let wav_path = state.store.recordings_dir().join(format!("{}.wav", meta.id));
 
-    // TODO: Actually stop the recorder and save WAV
-    // let duration = recorder.stop(&wav_path)?;
+    // Stop the recorder — saves WAV file (blocks until audio thread finishes)
+    let _duration = recorder.stop(&wav_path)?;
+
+    // Now remove the recorder from state
+    drop(recorder_guard);
+    state.recorder.lock().map_err(|e| e.to_string())?.take();
+
+    // Emit processing-started event
+    let _ = app.emit("processing-status", "Transcribing audio...");
+
+    // Clone what we need for the async pipeline task
+    let store = state.store.clone();
+    let wav_path_clone = wav_path.clone();
+    let session_name = meta.session_name.clone();
+    let notes = if meta.notes.is_empty() {
+        None
+    } else {
+        Some(meta.notes)
+    };
+
+    // Spawn the processing pipeline in a background task
+    tauri::async_runtime::spawn(async move {
+        let _ = pipeline::process_recording(
+            &wav_path_clone,
+            &session_name,
+            notes.as_deref(),
+            app,
+            &store,
+        )
+        .await
+        .map_err(|e| {
+            eprintln!("Processing pipeline error: {}", e);
+            e
+        });
+    });
 
     Ok(wav_path.to_string_lossy().to_string())
 }
@@ -98,34 +134,49 @@ async fn stop_recording(state: State<'_, AppState>) -> Result<String, String> {
 #[tauri::command]
 async fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
     let recorder_guard = state.recorder.lock().map_err(|e| e.to_string())?;
-    if let Some(ref recorder) = *recorder_guard {
-        recorder.pause()
-    } else {
-        Err("Not recording".into())
+    match recorder_guard.as_ref() {
+        Some(recorder) => recorder.pause(),
+        None => Err("Not recording".into()),
     }
 }
 
 #[tauri::command]
 async fn resume_recording(state: State<'_, AppState>) -> Result<(), String> {
     let recorder_guard = state.recorder.lock().map_err(|e| e.to_string())?;
-    if let Some(ref recorder) = *recorder_guard {
-        recorder.resume()
-    } else {
-        Err("Not recording".into())
+    match recorder_guard.as_ref() {
+        Some(recorder) => recorder.resume(),
+        None => Err("Not recording".into()),
     }
 }
 
 #[tauri::command]
 async fn get_audio_level(state: State<'_, AppState>) -> Result<AudioLevel, String> {
     let recorder_guard = state.recorder.lock().map_err(|e| e.to_string())?;
-    if let Some(ref recorder) = *recorder_guard {
-        Ok(AudioLevel {
+    match recorder_guard.as_ref() {
+        Some(recorder) => Ok(AudioLevel {
             rms: recorder.get_audio_level(),
             peak: 0.0,
             duration_secs: recorder.get_duration(),
-        })
+        }),
+        None => Ok(AudioLevel {
+            rms: 0.0,
+            peak: 0.0,
+            duration_secs: 0.0,
+        }),
+    }
+}
+
+#[tauri::command]
+async fn update_recording_notes(
+    notes: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut meta_guard = state.recording_meta.lock().map_err(|e| e.to_string())?;
+    if let Some(ref mut meta) = *meta_guard {
+        meta.notes = notes;
+        Ok(())
     } else {
-        Ok(AudioLevel { rms: 0.0, peak: 0.0, duration_secs: 0.0 })
+        Err("Not recording".into())
     }
 }
 
@@ -147,7 +198,11 @@ async fn delete_meeting(id: String, state: State<'_, AppState>) -> Result<(), St
 }
 
 #[tauri::command]
-async fn rename_meeting(id: String, name: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn rename_meeting(
+    id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let mut meeting = state.store.get_meeting(&id).map_err(|e| e.to_string())?;
     meeting.title = name;
     meeting.updated_at = chrono::Utc::now().to_rfc3339();
@@ -155,7 +210,11 @@ async fn rename_meeting(id: String, name: String, state: State<'_, AppState>) ->
 }
 
 #[tauri::command]
-async fn save_notes(id: String, notes: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn save_notes(
+    id: String,
+    notes: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let mut meeting = state.store.get_meeting(&id).map_err(|e| e.to_string())?;
     meeting.notes = Some(notes);
     meeting.updated_at = chrono::Utc::now().to_rfc3339();
@@ -163,7 +222,10 @@ async fn save_notes(id: String, notes: String, state: State<'_, AppState>) -> Re
 }
 
 #[tauri::command]
-async fn export_meeting_md(id: String, state: State<'_, AppState>) -> Result<String, String> {
+async fn export_meeting_md(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     let meeting = state.store.get_meeting(&id).map_err(|e| e.to_string())?;
     Ok(storage::markdown::export_meeting_markdown(&meeting))
 }
@@ -177,8 +239,18 @@ async fn query_meeting(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // TODO: Load meeting, stream Q&A via Ollama, emit query-chunk events
-    Err("Not yet implemented".into())
+    let meeting = state.store.get_meeting(&id).map_err(|e| e.to_string())?;
+    let transcript = meeting
+        .transcript_text
+        .ok_or("Meeting has no transcript")?;
+    let settings = state.store.get_settings().map_err(|e| e.to_string())?;
+
+    let client = OllamaClient::new(&settings.ollama_url, &settings.ollama_model);
+    client
+        .query_transcript_streaming(&transcript, &question, &settings.language, app)
+        .await?;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -188,8 +260,38 @@ async fn query_all(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // TODO: Load corpus, stream Q&A via Ollama, emit query-chunk events
-    Err("Not yet implemented".into())
+    let meetings = state.store.list_meetings().map_err(|e| e.to_string())?;
+    let settings = state.store.get_settings().map_err(|e| e.to_string())?;
+
+    // Build corpus from all meetings (or filtered by folder)
+    let mut corpus_parts = Vec::new();
+    for summary in &meetings {
+        if let Some(ref fid) = folder_id {
+            if summary.folder_id.as_deref() != Some(fid.as_str()) {
+                continue;
+            }
+        }
+        if let Ok(meeting) = state.store.get_meeting(&summary.id) {
+            if let Some(ref transcript) = meeting.transcript_text {
+                corpus_parts.push(format!(
+                    "--- Meeting: {} ({}) ---\n{}",
+                    meeting.title, meeting.created_at, transcript
+                ));
+            }
+        }
+    }
+
+    if corpus_parts.is_empty() {
+        return Err("No transcripts found to query.".into());
+    }
+
+    let corpus = corpus_parts.join("\n\n");
+    let client = OllamaClient::new(&settings.ollama_url, &settings.ollama_model);
+    client
+        .query_corpus_streaming(&corpus, &question, &settings.language, app)
+        .await?;
+
+    Ok(())
 }
 
 // ── Chat Commands ──────────────────────────────────────────────
@@ -212,7 +314,10 @@ async fn create_chat_session(
         folder_id,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    state.store.save_chat_session(&session, &[]).map_err(|e| e.to_string())?;
+    state
+        .store
+        .save_chat_session(&session, &[])
+        .map_err(|e| e.to_string())?;
     Ok(session)
 }
 
@@ -233,7 +338,10 @@ async fn update_settings(
     settings: SettingsPatch,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    state.store.update_settings(&settings).map_err(|e| e.to_string())
+    state
+        .store
+        .update_settings(&settings)
+        .map_err(|e| e.to_string())
 }
 
 // ── Setup / Model Commands ─────────────────────────────────────
@@ -242,30 +350,49 @@ async fn update_settings(
 async fn check_setup(state: State<'_, AppState>) -> Result<SetupStatus, String> {
     let settings = state.store.get_settings().map_err(|e| e.to_string())?;
 
+    // Check Ollama
+    let client = OllamaClient::new(&settings.ollama_url, &settings.ollama_model);
+    let ollama_running = client.health_check().await.unwrap_or(false);
+
     // Check whisper model
-    let model_path = state.store.whisper_models_dir()
+    let model_path = state
+        .store
+        .whisper_models_dir()
         .join(format!("ggml-{}.bin", settings.whisper_model));
     let whisper_downloaded = model_path.exists();
 
-    // Check microphone
-    let mic_available = cpal::default_host()
-        .default_input_device()
-        .is_some();
+    // Check Ollama model
+    let ollama_model_pulled = if ollama_running {
+        client
+            .list_models()
+            .await
+            .map(|models| {
+                models
+                    .iter()
+                    .any(|m| m.name == settings.ollama_model || m.name.starts_with(&settings.ollama_model))
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
 
-    // TODO: Check Ollama via HTTP when ai module is implemented
+    // Check microphone
+    let mic_available = cpal::default_host().default_input_device().is_some();
+
     Ok(SetupStatus {
-        ollama_installed: false,
-        ollama_running: false,
+        ollama_installed: ollama_running, // If it responds, it's installed
+        ollama_running,
         whisper_model_downloaded: whisper_downloaded,
-        ollama_model_pulled: false,
+        ollama_model_pulled,
         microphone_available: mic_available,
     })
 }
 
 #[tauri::command]
 async fn list_ollama_models(state: State<'_, AppState>) -> Result<Vec<ModelInfo>, String> {
-    // TODO: HTTP GET /api/tags to Ollama
-    Ok(vec![])
+    let settings = state.store.get_settings().map_err(|e| e.to_string())?;
+    let client = OllamaClient::new(&settings.ollama_url, &settings.ollama_model);
+    client.list_models().await
 }
 
 #[tauri::command]
@@ -274,8 +401,9 @@ async fn pull_ollama_model(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // TODO: Stream POST /api/pull, emit model-pull-progress events
-    Err("Not yet implemented".into())
+    let settings = state.store.get_settings().map_err(|e| e.to_string())?;
+    let client = OllamaClient::new(&settings.ollama_url, &settings.ollama_model);
+    client.pull_model(&name, app).await
 }
 
 #[tauri::command]
@@ -285,9 +413,20 @@ async fn download_whisper_model(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     // Validate model size
-    let valid_sizes = ["tiny", "base", "small", "medium", "large", "large-v3-turbo"];
+    let valid_sizes = [
+        "tiny",
+        "base",
+        "small",
+        "medium",
+        "large",
+        "large-v3-turbo",
+    ];
     if !valid_sizes.contains(&model_size.as_str()) {
-        return Err(format!("Invalid whisper model size: {}. Must be one of: {}", model_size, valid_sizes.join(", ")));
+        return Err(format!(
+            "Invalid whisper model size: {}. Must be one of: {}",
+            model_size,
+            valid_sizes.join(", ")
+        ));
     }
 
     let model_dir = state.store.whisper_models_dir();
@@ -304,23 +443,31 @@ async fn download_whisper_model(
 
     // Download with progress
     let client = reqwest::Client::new();
-    let mut response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to start download: {}", e))?;
 
     if !response.status().is_success() {
-        return Err(format!("Failed to download whisper model: HTTP {}", response.status()));
+        return Err(format!(
+            "Failed to download whisper model: HTTP {}",
+            response.status()
+        ));
     }
 
     let total_size = response.content_length().unwrap_or(0);
     let mut downloaded: u64 = 0;
-    let mut file = std::fs::File::create(&model_path).map_err(|e| e.to_string())?;
+    let mut file =
+        std::fs::File::create(&model_path).map_err(|e| format!("Failed to create file: {}", e))?;
 
     use futures_util::StreamExt;
     use std::io::Write;
 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        file.write_all(&chunk).map_err(|e| e.to_string())?;
+        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+        file.write_all(&chunk).map_err(|e| format!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
 
         if total_size > 0 {
@@ -371,7 +518,9 @@ async fn update_folder(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut folders = state.store.list_folders().map_err(|e| e.to_string())?;
-    let folder = folders.iter_mut().find(|f| f.id == id)
+    let folder = folders
+        .iter_mut()
+        .find(|f| f.id == id)
         .ok_or_else(|| format!("Folder not found: {}", id))?;
     folder.name = name;
     folder.icon = icon;
@@ -407,6 +556,7 @@ pub fn run() {
             pause_recording,
             resume_recording,
             get_audio_level,
+            update_recording_notes,
             // Meetings
             list_meetings,
             get_meeting,
