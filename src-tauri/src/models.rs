@@ -97,7 +97,7 @@ pub struct ChatMessage {
 }
 
 /// Application settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     pub language: String,
     pub whisper_model: String,
