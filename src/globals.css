@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+/* Design tokens — Miski AI */
+
+/* Light mode (default) */
+:root {
+  --background: #FFFFFF;
+  --surface: #F8F8F6;
+  --surface-raised: #F0EFEC;
+  --border: #E5E4DF;
+  --text-primary: #1A1A18;
+  --text-secondary: #6B6B66;
+  --accent: #4F46E5;
+  --accent-hover: #4338CA;
+  --success: #16A34A;
+  --warning: #D97706;
+  --danger: #DC2626;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', monospace;
+}
+
+/* Dark mode */
+.dark,
+[data-theme="dark"] {
+  --background: #0F0F0E;
+  --surface: #1A1A18;
+  --surface-raised: #24241F;
+  --border: #33332E;
+  --text-primary: #EDEAE0;
+  --text-secondary: #9A968A;
+  --accent: #818CF8;
+  --accent-hover: #6366F1;
+  --success: #22C55E;
+  --warning: #F59E0B;
+  --danger: #EF4444;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-border: var(--border);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+
+  --font-family-sans: var(--font-sans);
+  --font-family-mono: var(--font-mono);
+}
+
+/* Base styles */
+body {
+  font-family: var(--font-sans);
+  background-color: var(--background);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
