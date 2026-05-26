@@ -84,6 +84,8 @@ pub struct ChatSession {
     pub scope: String,
     pub folder_id: Option<String>,
     pub created_at: String,
+    #[serde(default)]
+    pub messages: Vec<ChatMessage>,
 }
 
 /// Chat message

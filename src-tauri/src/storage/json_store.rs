@@ -256,7 +256,10 @@ impl JsonStore {
                 continue;
             }
             if let Ok(data) = self.load_chat_file(&path) {
-                sessions.push(data.session);
+                // Return session with messages populated
+                let mut session = data.session;
+                session.messages = data.messages;
+                sessions.push(session);
             }
         }
 
@@ -264,13 +267,15 @@ impl JsonStore {
         Ok(sessions)
     }
 
-    pub fn get_chat_session(&self, id: &str) -> Result<(ChatSession, Vec<ChatMessage>)> {
+    pub fn get_chat_session(&self, id: &str) -> Result<ChatSession> {
         let path = self.chat_dir.join(format!("{}.json", id));
         if !path.exists() {
             anyhow::bail!("Chat session not found: {}", id);
         }
         let data = self.load_chat_file(&path)?;
-        Ok((data.session, data.messages))
+        let mut session = data.session;
+        session.messages = data.messages;
+        Ok(session)
     }
 
     pub fn save_chat_session(&self, session: &ChatSession, messages: &[ChatMessage]) -> Result<()> {

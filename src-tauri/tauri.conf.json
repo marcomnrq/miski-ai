@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "miski-ai",
+  "productName": "Miski AI",
   "version": "0.1.0",
   "identifier": "com.marcomnrq.miski-ai",
   "build": {
@@ -12,9 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "miski-ai",
-        "width": 800,
-        "height": 600
+        "title": "Miski AI — Meeting Intelligence",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true
       }
     ],
     "security": {

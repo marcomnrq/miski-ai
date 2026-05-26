@@ -1,6 +1,10 @@
-# Miski AI
-
-> Privacy-first, on-device meeting recorder with transcription, AI summarization, and speaker diarisation.
+<div align="center">
+  <img src="public/logo-rounded.png" alt="Miski AI Logo" width="128" height="128" />
+  
+  # Miski AI
+  
+  > Privacy-first, on-device meeting recorder with transcription, AI summarization, and speaker diarisation.
+</div>
 
 Miski AI is a complete rewrite of [StenoAI](https://github.com/ruzin/stenoai), replacing the Electron + Python stack with a single **Tauri v2 + Rust + React** application. Same core features, dramatically simpler architecture.
 

@@ -20,6 +20,7 @@ pub async fn process_recording(
     let settings = store.get_settings().map_err(|e| e.to_string())?;
 
     // 2. Load whisper model
+    let _ = app.emit("processing-status", "Loading whisper model...");
     let model_path = store
         .whisper_models_dir()
         .join(format!("ggml-{}.bin", settings.whisper_model));
@@ -27,6 +28,7 @@ pub async fn process_recording(
     let transcriber = WhisperTranscriber::new(&model_path)?;
 
     // 3. Transcribe
+    let _ = app.emit("processing-status", "Transcribing audio...");
     let lang = if settings.language == "auto" {
         None
     } else {
@@ -36,6 +38,7 @@ pub async fn process_recording(
     let result = transcriber.transcribe(wav_path, lang)?;
 
     // 4. Diarise
+    let _ = app.emit("processing-status", "Identifying speakers...");
     let diariser = Diariser::new();
     let labelled = diariser.detect_turns(&result.segments);
 
@@ -52,6 +55,7 @@ pub async fn process_recording(
     };
 
     // 5. Summarize (streaming)
+    let _ = app.emit("processing-status", "Generating summary...");
     let client = OllamaClient::new(&settings.ollama_url, &settings.ollama_model);
     let duration_minutes = (result.duration_seconds / 60.0).ceil() as u32;
 
@@ -105,6 +109,7 @@ pub async fn process_recording(
     };
 
     // 8. Save meeting
+    let _ = app.emit("processing-status", "Saving meeting...");
     store.save_meeting(&meeting).map_err(|e| e.to_string())?;
 
     // 9. Clean up WAV unless keep_recordings is set

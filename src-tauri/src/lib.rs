@@ -77,27 +77,26 @@ async fn stop_recording(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    // Take the recorder out (stops recording and saves WAV)
-    // Take the recorder out
-    let recorder_guard = state.recorder.lock().map_err(|e| e.to_string())?;
-    let recorder = recorder_guard
-        .as_ref()
+    // 1. Take the recorder out of state (moves it out of the Option, drops the guard)
+    let recorder = state
+        .recorder
+        .lock()
+        .map_err(|e| e.to_string())?
+        .take()
         .ok_or("Not recording")?;
 
-    // Take metadata
-    let mut meta_guard = state.recording_meta.lock().map_err(|e| e.to_string())?;
-    let meta = meta_guard
+    // 2. Take metadata (separate lock, guard dropped immediately)
+    let meta = state
+        .recording_meta
+        .lock()
+        .map_err(|e| e.to_string())?
         .take()
         .ok_or("No recording metadata")?;
 
     let wav_path = state.store.recordings_dir().join(format!("{}.wav", meta.id));
 
-    // Stop the recorder — saves WAV file (blocks until audio thread finishes)
+    // 3. Stop the recorder — saves WAV file (blocks until audio thread finishes)
     let _duration = recorder.stop(&wav_path)?;
-
-    // Now remove the recorder from state
-    drop(recorder_guard);
-    state.recorder.lock().map_err(|e| e.to_string())?.take();
 
     // Emit processing-started event
     let _ = app.emit("processing-status", "Transcribing audio...");
@@ -313,6 +312,7 @@ async fn create_chat_session(
         scope,
         folder_id,
         created_at: chrono::Utc::now().to_rfc3339(),
+        messages: vec![],
     };
     state
         .store
@@ -322,8 +322,103 @@ async fn create_chat_session(
 }
 
 #[tauri::command]
+async fn get_chat_session(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<ChatSession, String> {
+    state.store.get_chat_session(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn delete_chat_session(id: String, state: State<'_, AppState>) -> Result<(), String> {
     state.store.delete_chat_session(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn send_chat_message(
+    session_id: String,
+    question: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // Load the session
+    let mut session = state
+        .store
+        .get_chat_session(&session_id)
+        .map_err(|e| e.to_string())?;
+
+    // Add user message
+    let user_msg = ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.clone(),
+        role: "user".into(),
+        content: question.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    session.messages.push(user_msg.clone());
+
+    // Update title from first message if not set
+    if session.title.is_none() {
+        session.title = Some(question.chars().take(50).collect());
+    }
+
+    // Save session with user message
+    state
+        .store
+        .save_chat_session(&session, &session.messages)
+        .map_err(|e| e.to_string())?;
+
+    // Now stream the AI response
+    let settings = state.store.get_settings().map_err(|e| e.to_string())?;
+
+    // Build corpus from all meetings (or filtered by folder)
+    let meetings = state.store.list_meetings().map_err(|e| e.to_string())?;
+    let mut corpus_parts = Vec::new();
+    for summary in &meetings {
+        if let Some(ref fid) = session.folder_id {
+            if summary.folder_id.as_deref() != Some(fid.as_str()) {
+                continue;
+            }
+        }
+        if let Ok(meeting) = state.store.get_meeting(&summary.id) {
+            if let Some(ref transcript) = meeting.transcript_text {
+                corpus_parts.push(format!(
+                    "--- Meeting: {} ({}) ---\n{}",
+                    meeting.title, meeting.created_at, transcript
+                ));
+            }
+        }
+    }
+
+    if corpus_parts.is_empty() {
+        return Err("No transcripts found to query.".into());
+    }
+
+    let corpus = corpus_parts.join("\n\n");
+    let client = OllamaClient::new(&settings.ollama_url, &settings.ollama_model);
+
+    // Stream the response (emits query-chunk / query-complete events)
+    let answer = client
+        .query_corpus_streaming(&corpus, &question, &settings.language, app.clone())
+        .await?;
+
+    // Add assistant message
+    let assistant_msg = ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.clone(),
+        role: "assistant".into(),
+        content: answer,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    session.messages.push(assistant_msg);
+
+    // Save session with assistant message
+    state
+        .store
+        .save_chat_session(&session, &session.messages)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 // ── Settings Commands ──────────────────────────────────────────
@@ -342,6 +437,13 @@ async fn update_settings(
         .store
         .update_settings(&settings)
         .map_err(|e| e.to_string())
+}
+
+// ── Utility Commands ────────────────────────────────────────────
+
+#[tauri::command]
+async fn get_data_dir(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state.store.base_dir().to_string_lossy().to_string())
 }
 
 // ── Setup / Model Commands ─────────────────────────────────────
@@ -570,10 +672,14 @@ pub fn run() {
             // Chat
             list_chat_sessions,
             create_chat_session,
+            get_chat_session,
             delete_chat_session,
+            send_chat_message,
             // Settings
             get_settings,
             update_settings,
+            // Utility
+            get_data_dir,
             // Setup / Models
             check_setup,
             list_ollama_models,
